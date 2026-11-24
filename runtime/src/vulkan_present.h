@@ -998,6 +998,7 @@ private:
         info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         if (vk.vkCreateBuffer(device, &info, nullptr, &capture_buffer_) != VK_SUCCESS) return false;
+        if (!vkGetPhysicalDeviceMemoryProperties_) return false;
         VkMemoryRequirements requirements{};
         vk.vkGetBufferMemoryRequirements(device, capture_buffer_, &requirements);
         VkPhysicalDeviceMemoryProperties memory{};
