@@ -3465,9 +3465,17 @@ public:
                 return E_NOTIMPL;
             }
             if (stream_output_desc.NumStrides > device_.info.max_transform_feedback_buffers) return E_INVALIDARG;
-            if (stream_output_desc.RasterizedStream != 0) {
-                log_once("StreamOutput with a RasterizedStream other than 0 is not supported yet; stage", 1);
-                return E_NOTIMPL;
+            // D3D12_SO_NO_RASTERIZED_STREAM (no stream is rasterized) needs only rasterizerDiscardEnable, always
+            // available. A real, non-default stream index needs picking which stream the rasterizer reads
+            // (VkPipelineRasterizationStateStreamCreateInfoEXT), which needs the geometryStreams feature.
+            if (stream_output_desc.RasterizedStream != 0 &&
+                stream_output_desc.RasterizedStream != D3D12_SO_NO_RASTERIZED_STREAM) {
+                if (stream_output_desc.RasterizedStream >= device_.info.max_transform_feedback_streams)
+                    return E_INVALIDARG;
+                if (!device_.info.transform_feedback_geometry_streams) {
+                    log_once("a non-zero RasterizedStream needs the Vulkan geometryStreams feature; stage", 1);
+                    return E_NOTIMPL;
+                }
             }
         }
         // A geometry shader is the translator's Vulkan geometry stage (docs/design.md, "Geometry shaders"): it takes
@@ -3954,9 +3962,11 @@ public:
 
         // Kept for variants: a draw that leaves a slot unbound needs this pipeline with that format undefined.
         graphics_.mesh = mesh;
-        if (stream_output)
+        if (stream_output) {
             graphics_.so_strides.assign(stream_output_desc.pBufferStrides,
                                         stream_output_desc.pBufferStrides + stream_output_desc.NumStrides);
+            recipe_.so_rasterized_stream = stream_output_desc.RasterizedStream;
+        }
         recipe_.mesh = mesh;
         recipe_.stages = std::move(stage_infos);
         recipe_.attributes = std::move(attributes);
@@ -4115,6 +4125,10 @@ private:
         VkPipelineInputAssemblyStateCreateInfo assembly{};
         VkPipelineRasterizationStateCreateInfo raster{};
         bool conservative = false;
+        // D3D12_STREAM_OUTPUT_DESC::RasterizedStream (D3D-302): 0 (the default, needs nothing extra here),
+        // D3D12_SO_NO_RASTERIZED_STREAM (rasterizerDiscardEnable), or a real stream index
+        // (VkPipelineRasterizationStateStreamCreateInfoEXT, needs geometryStreams).
+        std::uint32_t so_rasterized_stream = 0;
         VkPipelineMultisampleStateCreateInfo multisample{};
         VkSampleMask sample_mask = ~0u;
         VkPipelineDepthStencilStateCreateInfo depth{};
@@ -4169,6 +4183,18 @@ private:
             conservative.extraPrimitiveOverestimationSize = 0.0f;
             conservative.pNext = raster.pNext;
             raster.pNext = &conservative;
+        }
+        // D3D-302: D3D12_SO_NO_RASTERIZED_STREAM (no stream reaches the rasterizer) is rasterizerDiscardEnable; a
+        // real non-zero stream picks which one does (create_graphics already refused this device_.info without
+        // geometryStreams).
+        VkPipelineRasterizationStateStreamCreateInfoEXT raster_stream{
+            VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_STREAM_CREATE_INFO_EXT};
+        if (r.so_rasterized_stream == D3D12_SO_NO_RASTERIZED_STREAM) {
+            raster.rasterizerDiscardEnable = VK_TRUE;
+        } else if (r.so_rasterized_stream != 0) {
+            raster_stream.rasterizationStream = r.so_rasterized_stream;
+            raster_stream.pNext = raster.pNext;
+            raster.pNext = &raster_stream;
         }
         multisample.pSampleMask = &r.sample_mask;
         VkPipelineColorBlendStateCreateInfo blend = r.blend;

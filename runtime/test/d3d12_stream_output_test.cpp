@@ -1,7 +1,9 @@
 // D3D-302: a StreamOutput PSO and SOSetTargets actually capture a draw's vertex output on the Vulkan-backed
 // device. vs_stream_output.vert writes the fixed vec4 (1, 2, 3, 4) to an Xfb-decorated output (buffer 0, stride
 // 16 bytes); the PSO declares one matching StreamOutput buffer slot. After a 3-vertex draw, the buffer is read
-// back and every vertex's 16 bytes are checked against that constant. No game data; needs VK_EXT_transform_feedback.
+// back and every vertex's 16 bytes are checked against that constant, for RasterizedStream 0 (the ordinary case)
+// and D3D12_SO_NO_RASTERIZED_STREAM (capture-only, rasterizerDiscardEnable): both must still capture correctly.
+// No game data; needs VK_EXT_transform_feedback.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
@@ -16,8 +18,122 @@
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } \
 } while (0)
+#define CHECK(condition) do { \
+    if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return false; } \
+} while (0)
 
 using namespace d3d12test;
+
+namespace {
+
+// Builds a StreamOutput PSO with the given RasterizedStream, draws 3 vertices through it, and checks that the
+// buffer SOSetTargets bound captured 3 copies of vs_stream_output.vert's fixed vec4 (1, 2, 3, 4).
+bool run_case(ID3D12Device* device, ID3D12RootSignature* root, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
+             const std::vector<std::uint8_t>& vs_container, const std::vector<std::uint8_t>& ps_container,
+             UINT width, UINT height, UINT rasterized_stream, const char* label) {
+    const UINT stride = 16;
+    const D3D12_SO_DECLARATION_ENTRY so_entry{0, "OUT", 0, 0, 4, 0};
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc{};
+    pso_desc.pRootSignature = root;
+    pso_desc.VS = {vs_container.data(), vs_container.size()};
+    pso_desc.PS = {ps_container.data(), ps_container.size()};
+    pso_desc.StreamOutput.pSODeclaration = &so_entry;
+    pso_desc.StreamOutput.NumEntries = 1;
+    pso_desc.StreamOutput.pBufferStrides = &stride;
+    pso_desc.StreamOutput.NumStrides = 1;
+    pso_desc.StreamOutput.RasterizedStream = rasterized_stream;
+    pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pso_desc.SampleMask = 0xffffffff;
+    pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pso_desc.RasterizerState.DepthClipEnable = TRUE;
+    pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pso_desc.NumRenderTargets = 1;
+    pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pso_desc.SampleDesc.Count = 1;
+    Ref<ID3D12PipelineState> pso;
+    CHECK(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso.p))));
+
+    // The SO buffer (DEFAULT heap, created directly in STREAM_OUT state) and a READBACK copy of it.
+    constexpr UINT64 so_bytes = 256;
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC buf_desc{};
+    buf_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buf_desc.Width = so_bytes;
+    buf_desc.Height = 1;
+    buf_desc.DepthOrArraySize = 1;
+    buf_desc.MipLevels = 1;
+    buf_desc.SampleDesc.Count = 1;
+    buf_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    Ref<ID3D12Resource> so_buffer;
+    CHECK(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &buf_desc,
+                                                    D3D12_RESOURCE_STATE_STREAM_OUT, nullptr,
+                                                    IID_PPV_ARGS(&so_buffer.p))));
+    const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
+    Ref<ID3D12Resource> so_readback;
+    CHECK(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &buf_desc,
+                                                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                    IID_PPV_ARGS(&so_readback.p))));
+
+    const D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12Fence> fence;
+    CHECK(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+    CHECK(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, pso.p,
+                                              IID_PPV_ARGS(&list.p))));
+    CHECK(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+
+    list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    const D3D12_VIEWPORT viewport{0, 0, float(width), float(height), 0, 1};
+    const D3D12_RECT scissor{0, 0, LONG(width), LONG(height)};
+    list->RSSetViewports(1, &viewport);
+    list->RSSetScissorRects(1, &scissor);
+    list->SetGraphicsRootSignature(root);
+    list->SetPipelineState(pso.p);
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const D3D12_STREAM_OUTPUT_BUFFER_VIEW so_view{so_buffer->GetGPUVirtualAddress(), so_bytes, 0};
+    list->SOSetTargets(0, 1, &so_view);
+    list->DrawInstanced(3, 1, 0, 0);
+    const auto to_copy_src = transition(so_buffer.p, D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->ResourceBarrier(1, &to_copy_src);
+    list->CopyBufferRegion(so_readback.p, 0, so_buffer.p, 0, so_bytes);
+    CHECK(SUCCEEDED(list->Close()));
+
+    ID3D12CommandList* lists[] = {list.p};
+    queue->ExecuteCommandLists(1, lists);
+    CHECK(SUCCEEDED(queue->Signal(fence.p, 1)));
+    const HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    CHECK(ev != nullptr);
+    const bool done = SUCCEEDED(fence->SetEventOnCompletion(1, ev)) && WaitForSingleObject(ev, 20000) == WAIT_OBJECT_0;
+    CloseHandle(ev);
+    CHECK(done);
+
+    void* mapped = nullptr;
+    CHECK(SUCCEEDED(so_readback->Map(0, nullptr, &mapped)) && mapped);
+    const auto* floats = static_cast<const float*>(mapped);
+    int mismatches = 0;
+    for (int vertex = 0; vertex < 3; ++vertex) {
+        const float expected[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+        for (int component = 0; component < 4; ++component) {
+            const float got = floats[vertex * 4 + component];
+            if (got != expected[component]) {
+                std::fprintf(stderr, "%s: vertex %d component %d: got %f, expected %f\n", label, vertex, component,
+                            double(got), double(expected[component]));
+                ++mismatches;
+            }
+        }
+    }
+    const D3D12_RANGE no_write{0, 0};
+    so_readback->Unmap(0, &no_write);
+    CHECK(mismatches == 0);
+    std::printf("stream_output %s: 3 vertices captured, %d mismatches\n", label, mismatches);
+    return true;
+}
+
+}  // namespace
 
 int main() {
     vktest::Device vk;
@@ -101,107 +217,14 @@ int main() {
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
     device->CreateRenderTargetView(target.p, nullptr, rtv);
 
-    // One StreamOutput buffer slot, stride 16 bytes (one vec4), matching the shader's Xfb decoration.
-    const UINT stride = 16;
-    const D3D12_SO_DECLARATION_ENTRY so_entry{0, "OUT", 0, 0, 4, 0};
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc{};
-    pso_desc.pRootSignature = root.p;
-    pso_desc.VS = {vs_container.data(), vs_container.size()};
-    pso_desc.PS = {ps_container.data(), ps_container.size()};
-    pso_desc.StreamOutput.pSODeclaration = &so_entry;
-    pso_desc.StreamOutput.NumEntries = 1;
-    pso_desc.StreamOutput.pBufferStrides = &stride;
-    pso_desc.StreamOutput.NumStrides = 1;
-    pso_desc.StreamOutput.RasterizedStream = 0;
-    pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    pso_desc.SampleMask = 0xffffffff;
-    pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    pso_desc.RasterizerState.DepthClipEnable = TRUE;
-    pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pso_desc.NumRenderTargets = 1;
-    pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    pso_desc.SampleDesc.Count = 1;
-    Ref<ID3D12PipelineState> pso;
-    EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso.p))));
+    // RasterizedStream 0: the ordinary case (also exercised by d3d12_m2_textured_test-style draws elsewhere, but
+    // not with StreamOutput).
+    EXPECT(run_case(device.p, root.p, rtv, vs_container, ps_container, width, height, 0, "RasterizedStream=0"));
+    // D3D12_SO_NO_RASTERIZED_STREAM: capture-only (rasterizerDiscardEnable). Must still capture every vertex;
+    // only the (unchecked) render target's contents should differ.
+    EXPECT(run_case(device.p, root.p, rtv, vs_container, ps_container, width, height,
+                    D3D12_SO_NO_RASTERIZED_STREAM, "NO_RASTERIZED_STREAM"));
 
-    // The SO buffer (DEFAULT heap, created directly in STREAM_OUT state) and a READBACK copy of it.
-    constexpr UINT64 so_bytes = 256;
-    D3D12_RESOURCE_DESC buf_desc{};
-    buf_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    buf_desc.Width = so_bytes;
-    buf_desc.Height = 1;
-    buf_desc.DepthOrArraySize = 1;
-    buf_desc.MipLevels = 1;
-    buf_desc.SampleDesc.Count = 1;
-    buf_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    Ref<ID3D12Resource> so_buffer;
-    EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &buf_desc,
-                                                     D3D12_RESOURCE_STATE_STREAM_OUT, nullptr,
-                                                     IID_PPV_ARGS(&so_buffer.p))));
-    const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
-    Ref<ID3D12Resource> so_readback;
-    EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &buf_desc,
-                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                     IID_PPV_ARGS(&so_readback.p))));
-
-    const D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
-    Ref<ID3D12CommandQueue> queue;
-    Ref<ID3D12CommandAllocator> allocator;
-    Ref<ID3D12GraphicsCommandList> list;
-    Ref<ID3D12Fence> fence;
-    EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
-    EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
-    EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, pso.p,
-                                               IID_PPV_ARGS(&list.p))));
-    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
-
-    list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-    const D3D12_VIEWPORT viewport{0, 0, float(width), float(height), 0, 1};
-    const D3D12_RECT scissor{0, 0, LONG(width), LONG(height)};
-    list->RSSetViewports(1, &viewport);
-    list->RSSetScissorRects(1, &scissor);
-    list->SetGraphicsRootSignature(root.p);
-    list->SetPipelineState(pso.p);
-    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    const D3D12_STREAM_OUTPUT_BUFFER_VIEW so_view{so_buffer->GetGPUVirtualAddress(), so_bytes, 0};
-    list->SOSetTargets(0, 1, &so_view);
-    list->DrawInstanced(3, 1, 0, 0);
-    const auto to_copy_src = transition(so_buffer.p, D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    list->ResourceBarrier(1, &to_copy_src);
-    list->CopyBufferRegion(so_readback.p, 0, so_buffer.p, 0, so_bytes);
-    EXPECT(SUCCEEDED(list->Close()));
-
-    ID3D12CommandList* lists[] = {list.p};
-    queue->ExecuteCommandLists(1, lists);
-    EXPECT(SUCCEEDED(queue->Signal(fence.p, 1)));
-    const HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    EXPECT(ev != nullptr);
-    const bool done = SUCCEEDED(fence->SetEventOnCompletion(1, ev)) && WaitForSingleObject(ev, 20000) == WAIT_OBJECT_0;
-    CloseHandle(ev);
-    EXPECT(done);
-
-    void* mapped = nullptr;
-    EXPECT(SUCCEEDED(so_readback->Map(0, nullptr, &mapped)) && mapped);
-    const auto* floats = static_cast<const float*>(mapped);
-    int mismatches = 0;
-    for (int vertex = 0; vertex < 3; ++vertex) {
-        const float expected[4] = {1.0f, 2.0f, 3.0f, 4.0f};
-        for (int component = 0; component < 4; ++component) {
-            const float got = floats[vertex * 4 + component];
-            if (got != expected[component]) {
-                std::fprintf(stderr, "vertex %d component %d: got %f, expected %f\n", vertex, component,
-                            double(got), double(expected[component]));
-                ++mismatches;
-            }
-        }
-    }
-    const D3D12_RANGE no_write{0, 0};
-    so_readback->Unmap(0, &no_write);
-    EXPECT(mismatches == 0);
-
-    std::printf("stream_output: 3 vertices captured through SOSetTargets + a StreamOutput PSO, %d mismatches\n",
-               mismatches);
     std::filesystem::remove_all(fixture);
     return 0;
 }

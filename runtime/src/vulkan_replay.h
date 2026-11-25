@@ -779,10 +779,11 @@ struct GraphicsPipeline {
     static constexpr std::uint32_t unbound_depth = 1u << 8;
     std::function<VkPipeline(std::uint32_t unbound)> variant;
     std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
-    // D3D12_STREAM_OUTPUT_DESC, kept to capture and wrap draws with this pipeline bound (D3D-302). Empty
-    // so_strides: the PSO declared no StreamOutput, same as before this was tracked at all.
-    std::vector<std::uint32_t> so_strides;       // by buffer slot, NumStrides entries
-    std::uint32_t so_rasterized_stream = 0;      // D3D12_SO_NO_RASTERIZED_STREAM: no stream is rasterized
+    // D3D12_STREAM_OUTPUT_DESC buffer strides, kept to capture and wrap draws with this pipeline bound (D3D-302).
+    // Empty: the PSO declared no StreamOutput, same as before this was tracked at all. RasterizedStream only
+    // matters at pipeline creation (which stream the rasterizer reads, Device::build's so_rasterized_stream); a
+    // draw's capture itself is per XFB buffer slot and does not depend on it.
+    std::vector<std::uint32_t> so_strides;  // by buffer slot, NumStrides entries
     bool has_stream_output() const { return !so_strides.empty(); }
 };
 
