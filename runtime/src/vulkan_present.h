@@ -990,6 +990,7 @@ private:
     // (Re)creates the capture buffer for the current swapchain size: host visible, coherent, persistently mapped.
     bool make_capture_buffer() {
         release_capture();
+        if (!vkGetPhysicalDeviceMemoryProperties_) return false;
         auto& vk = context_.vk;
         const VkDevice device = context_.device();
         capture_size_ = VkDeviceSize(extent_.width) * extent_.height * 4;
@@ -998,7 +999,6 @@ private:
         info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         if (vk.vkCreateBuffer(device, &info, nullptr, &capture_buffer_) != VK_SUCCESS) return false;
-        if (!vkGetPhysicalDeviceMemoryProperties_) return false;
         VkMemoryRequirements requirements{};
         vk.vkGetBufferMemoryRequirements(device, capture_buffer_, &requirements);
         VkPhysicalDeviceMemoryProperties memory{};
